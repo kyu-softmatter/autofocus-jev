@@ -1,0 +1,41 @@
+[project]
+name = "autofocus-jev"
+version = "0.1.0"
+description = "Microscope focus evaluation and autofocus experiments using Jev"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy",
+    "pymmcore",
+    "scikit-image",
+    "scipy",
+    "tifffile",
+    "typesafe-sdk",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "ruff",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/autofocus_jev"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.uv]
+required-version = ">=0.8.0"
