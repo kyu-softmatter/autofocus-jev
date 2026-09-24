@@ -415,6 +415,8 @@ tests/
 - `uv.lock`으로 의존성 버전을 고정했다.
 - `.gitignore`에 가상환경, API key, 현미경 데이터와 생성 결과를 제외했다.
 - `.env.example`에 TypeSafe 관련 환경변수 예시를 추가했다.
+- MIT License를 적용했다.
+- GitHub Actions에서 lockfile, test, lint와 format을 검사하는 CI를 구성했다.
 - 최소 패키지와 smoke test를 만들었다.
 - `uv sync --frozen`, Pytest, Ruff lint와 format 검사를 통과했다.
 
@@ -587,6 +589,8 @@ Jev가 baseline보다 복잡하기 때문에 정확도뿐 아니라 robustness, 
 ## 13. 재현성과 Git 정책
 
 - 새 환경은 `git clone` 후 `uv sync --frozen`으로 설치한다.
+- 저장소는 MIT License로 공개한다.
+- `main` push와 pull request마다 GitHub Actions CI를 실행한다.
 - dependency 변경은 `uv add` 또는 `uv remove`로 수행한다.
 - `pyproject.toml`과 `uv.lock`은 항상 함께 커밋한다.
 - 실제 `.env`, API key, 원본 데이터와 대용량 결과는 커밋하지 않는다.

@@ -3,6 +3,7 @@ name = "autofocus-jev"
 version = "0.1.0"
 description = "Microscope focus evaluation and autofocus experiments using Jev"
 requires-python = ">=3.12,<3.13"
+license = "MIT"
 dependencies = [
     "numpy",
     "pymmcore",
