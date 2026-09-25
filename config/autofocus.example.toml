@@ -1,0 +1,64 @@
+[hardware]
+device_adapter_path = "C:/Program Files/Micro-Manager-2.0"
+system_config_path = "C:/path/to/camera_red_only.cfg"
+camera_label = "Kinetix_red"
+xy_stage_label = "XYStage"
+focus_device_label = "ZDrive"
+
+[focus]
+pfs_device_label = "PFS"
+pfs_offset_device_label = "PFSOffset"
+pfs_policy = "require_off"
+# Fill these only after confirming the property and values on the microscope.
+# Z motion remains disabled while they are absent.
+# pfs_status_property = "State"
+# pfs_safe_values = ["Off"]
+
+[camera]
+roi_xyxy = [0, 2400, 0, 2400]
+exposure_ms = 30.0
+acquisition_period_s = 0.1
+sequence_interval_ms = 0.05
+pixel_size_um_override = 0.65
+shutter_mode = "Never"
+port = "Dynamic Range"
+
+[illumination]
+dia_lamp_on = false
+auto_shutter = false
+pattern_engine = "LightEngine"
+pattern_channel = "GREEN"
+pattern_intensity = 500
+pattern_on = false
+focus_engine = "Aura"
+focus_channel = "GREEN"
+focus_intensity = 50
+focus_on = false
+
+[optical_path]
+nosepiece_state = "1"
+condenser_turret_state = "2"
+lapp_main_branch_state = "1"
+light_path_state = "3"
+csu_dichroic_state = "0"
+csu_port_state = "2"
+csu_bright_field_port = "Bright Field"
+csu_shutter_state = "Closed"
+turret1_shutter_on = true
+turret2_shutter_on = true
+
+[dmd]
+enabled = false
+require_device = true
+calibration_path = "C:/path/to/calibration_models.json"
+
+[autofocus]
+history_window_s = 3.0
+probe_step_um = 0.2
+max_probes = 20
+min_z_um = -10.0
+max_z_um = 10.0
+
+[jev]
+model = "jev-1.13.0"
+request_timeout_s = 10.0

@@ -61,7 +61,7 @@ Microscope process                 Jev process
 ### 3.3 현재 범위에서 제외하는 작업
 
 - 개별 현미경 제조사 SDK와의 직접 연동
-- 실제 Z stage 자동 이동
+- 안전 제한과 사용자 승인을 두지 않은 실제 Z stage 이동
 - Jev 자체의 fine-tuning 또는 LoRA 학습
 - 원본 현미경 이미지를 Jev에 직접 입력하는 방식
 - 단일 Score 결과로 연속적인 Z 오차를 회귀하는 방식
@@ -122,13 +122,43 @@ Jev 출력은 stage 명령으로 직접 전달하지 않는다. 다음 조건을
 - Micro-Manager device adapter 검색 경로 설정
 - 장비별 Micro-Manager configuration 로딩
 - 현재 camera 및 focus device 확인
-- single-frame capture와 NumPy array 반환
+- continuous sequence acquisition과 최신 NumPy frame 제공
+- 진단용 single-frame capture
 - 현재 Z 위치 조회
 - 제한된 absolute 또는 relative Z 이동
 - 장치 대기, 오류 변환과 안전한 종료
 
 실제 장비 이름, serial number, port와 property는 코드에 고정하지 않고 Micro-Manager
 configuration 및 로컬 설정에서 읽는다.
+
+첫 실제 장비 프로파일은 `bacteria4`와 같은 rig를 대상으로 한다. 따라서 아래 label과 장치 관계를
+초기 지원 대상으로 삼되, 시작할 때 loaded device 및 property readback과 일치하는지 검증한다.
+
+- camera: `Kinetix_red`
+- XY stage: `XYStage`
+- focus drive: Nikon Ti2 `ZDrive`
+- hardware focus support: `PFS`와 `PFSOffset`
+- pattern illumination: `LightEngine`, 기본 channel `GREEN`, DMD 경유
+- autofocus illumination: `Aura`, channel `GREEN`, widefield
+- optical path: `Nosepiece`, `CondenserTurret`, `LappMainBranch1`, `LightPath`, CSUW1 장치와 shutter
+- SLM/DMD: Micro-Manager가 `getSLMDevice()`로 반환하는 장치
+
+같은 rig에서 camera buffer 접근과 DMD pattern submission이 같은 USB 경로를 공유한다. 이 프로젝트는
+별도의 camera thread와 DMD thread가 각자 core를 호출하지 않고 microscope process의 단일 hardware
+event loop에 두 작업을 넣어 직렬화한다. 향후 별도 thread가 꼭 필요해지면 `bacteria4`와 같은 공용
+USB mutex를 camera polling과 `setSLMImage`/`displaySLMImage` 전체에 적용한다.
+
+Autofocus 실험 중 DMD, light engine과 optical path를 계속 바꿀 필요는 없지만, 이 장치들을 무시해서는
+안 된다. session 시작 시 명시된 imaging profile을 적용하고 readback한 뒤 고정하며, Jev 판단 중 해당
+상태가 바뀌면 `hardware_state_version`을 증가시켜 이전 판단을 폐기한다. 종료 시에는 모든 light
+channel과 intensity를 0으로 만들고 shutter를 닫은 뒤 core를 reset한다. Filter wheel은 자동으로
+움직이지 않는다.
+
+`bacteria4`의 Python adapter에는 `XYStage` 제어만 구현되어 있지만 `camera_red_only.cfg`에는 Nikon Ti2
+`ZDrive`, `PFS`와 `PFSOffset`이 선언되어 있다. 이 프로젝트는 `ZDrive`를 기본 focus device로 명시하고
+`setFocusDevice` 후 readback한다. 다만 이동 방향, 단위, soft limit과 backlash는 수동 시험으로 확인해야
+한다. PFS가 활성화되어 있으면 software Z probe와 충돌할 수 있으므로, PFS 상태를 읽을 수 있고 profile이
+요구한 상태인지 검증하기 전에는 Z 이동 command를 거부한다.
 
 ### 4.5 `pymmcore`와 Jev는 별도 process에서 실행한다
 
@@ -153,6 +183,11 @@ Microscope process는 `CMMCore`를 process 내부에서 생성한다. 부모 pro
 `fork`로 상속하지 않는다. 운영체제에 관계없이 Python multiprocessing의 `spawn` start method를
 명시적으로 사용한다. `CMMCore`에는 microscope process만 접근하며 다른 process가 직접 장치를
 호출하지 않는다.
+
+Microscope process 내부에서도 `CMMCore` 호출은 하나의 event loop thread에서 직렬화한다. Camera
+buffer polling, metadata readback와 Z command가 모두 같은 실행 경로를 지나도록 하며, 다른 thread가
+core를 직접 호출하지 않는다. 이는 참고 프로젝트의 camera/DMD mutex보다 더 단순한 autofocus 전용
+규칙이다.
 
 Jev process는 하드웨어를 전혀 알지 못한다. Controller가 만든 snapshot을 받아 API를 호출하고,
 typed decision을 반환한다. Jev 요청이 지연되거나 실패해도 microscope process의 heartbeat와
@@ -240,6 +275,162 @@ Z 범위와 최대 step을 검사해 방어 계층을 이중화한다.
 
 Hardware worker가 실행하는 명령에도 자체 유효기간과 precondition을 넣는다. 따라서 Controller가
 멈춘 직후 queue에 남아 있던 오래된 이동 명령이 뒤늦게 실행되지 않는다.
+
+### 4.10 Micro-Manager 설정과 애플리케이션 설정을 분리한다
+
+`bacteria4`의 `pars.json` → typed config → device factory 흐름은 재사용하되, 장비 전용 값과
+autofocus 정책을 한 파일에 평면적으로 섞지 않는다. 설정은 다음 세 계층으로 나눈다.
+
+1. **Micro-Manager system configuration**: Micro-Manager가 생성한 `.cfg` 파일
+2. **Application configuration**: 저장소에 예제로 배포할 `config/autofocus.example.toml`
+3. **Secret 및 host override**: Git에서 제외되는 `.env` 또는 명시적 CLI option
+
+Application configuration은 Python 3.12의 `tomllib`로 읽고 typed dataclass로 검증한다. 예상
+section은 다음과 같다.
+
+```toml
+[hardware]
+device_adapter_path = "C:/Program Files/Micro-Manager-2.0"
+system_config_path = "C:/path/to/camera_red_only.cfg"
+camera_label = "Kinetix_red"
+xy_stage_label = "XYStage"
+focus_device_label = "ZDrive"
+
+[focus]
+pfs_device_label = "PFS"
+pfs_offset_device_label = "PFSOffset"
+pfs_policy = "require_off"
+# pfs_status_property와 pfs_safe_values를 실제 장비에서 확인하기 전에는 Z 이동을 금지한다.
+
+[camera]
+roi_xyxy = [0, 2400, 0, 2400]
+exposure_ms = 30.0
+acquisition_period_s = 0.1
+sequence_interval_ms = 0.05
+pixel_size_um_override = 0.65
+
+[illumination]
+dia_lamp_on = false
+auto_shutter = false
+pattern_engine = "LightEngine"
+pattern_channel = "GREEN"
+pattern_intensity = 500
+pattern_on = false
+focus_engine = "Aura"
+focus_channel = "GREEN"
+focus_intensity = 50
+focus_on = false
+
+[optical_path]
+nosepiece_state = "1"
+condenser_turret_state = "2"
+lapp_main_branch_state = "1"
+light_path_state = "3"
+csu_dichroic_state = "0"
+csu_port_state = "2"
+csu_bright_field_port = "Bright Field"
+csu_shutter_state = "Closed"
+turret1_shutter_on = true
+turret2_shutter_on = true
+
+[dmd]
+enabled = false
+require_device = true
+calibration_path = "C:/path/to/calibration_models.json"
+
+[autofocus]
+history_window_s = 3.0
+probe_step_um = 0.2
+max_probes = 20
+min_z_um = -10.0
+max_z_um = 10.0
+
+[jev]
+model = "jev-1.13.0"
+request_timeout_s = 10.0
+```
+
+위 값은 동일 rig의 `bacteria4/pars.json`을 기반으로 한 초기 profile이며 검증 없이 안전한 값으로
+간주하지 않는다. 특히 Aura intensity scale, DMD 방향, pixel size가 대응하는 objective, PFS 상태와
+Z limit은 장비에서 확인해야 한다. 경로와 장비별 보정값은 별도의 로컬 configuration에서 명시한다.
+`TYPESAFE_API_KEY`는 configuration 파일에 저장하지 않고 환경변수에서만 읽는다.
+`roi_xyxy`는 `[x0, x1, y0, y1]`이며 adapter 경계에서 CMMCore의 `(x, y, width, height)` 형식으로
+한 번만 변환한다.
+
+설정 필드는 두 종류로 구분한다.
+
+- **Startup-only**: adapter path, system `.cfg`, camera/focus/XY/SLM label, ROI, exposure, acquisition
+  period, illumination engine, optical path와 shared-memory shape. 변경하려면 hardware process를
+  재시작한다.
+- **Runtime policy**: history window, Jev threshold, probe step, 최대 probe 수. 검증 후 session 경계에서
+  다시 읽을 수 있다.
+
+Unknown key는 무시하지 않고 오류로 처리해 오타를 조기에 발견한다. 모든 상대 경로는 현재 작업
+directory가 아니라 application configuration 파일의 위치를 기준으로 해석한다. 시작할 때 원본
+설정, 환경변수 override, hardware readback을 합친 resolved configuration snapshot을 결과 폴더에
+저장한다.
+
+### 4.11 Camera frame과 metadata를 함께 다룬다
+
+참고 프로젝트처럼 `startContinuousSequenceAcquisition`을 시작하고 circular buffer를 주기적으로
+비운다. 처리 속도가 acquisition보다 느릴 때 backlog를 모두 따라가지 않고 최신 frame을 우선한다.
+각 publish에는 연속적인 `frame_id`를 부여해 건너뛴 frame 수를 사후 계산할 수 있게 한다.
+
+정적 camera 정보는 configuration 로딩과 camera 선택이 끝난 직후 한 번 읽어 `CameraInfo`로
+기록한다.
+
+- MMCore version과 Device API version
+- camera label과 focus device label
+- width, height, ROI와 binning
+- bytes per pixel, image bit depth와 component 수
+- image buffer size
+- exposure
+- Micro-Manager pixel size와 그 값의 source
+- 허용 목록으로 제한한 camera property readback
+
+Micro-Manager의 `pixel_size_um`이 0 또는 유효하지 않으면 application configuration의 override를
+사용하고 `pixel_size_source = "config_override"`로 표시한다. 두 값이 모두 없으면 픽셀 크기가
+필요한 계산을 중단하며 임의의 값을 추정하지 않는다.
+
+각 frame에는 다음 `FrameMetadata`를 붙인다.
+
+- `frame_id`
+- monotonic acquisition timestamp와 UTC log timestamp
+- timestamp source; 초기 구현은 camera timestamp가 아닌 `host_after_buffer_pop`으로 명시
+- camera label
+- shape와 NumPy dtype
+- ROI, exposure와 binning
+- autofocus illumination engine, channel, on/off와 intensity readback
+- frame 획득 시점의 `z_um`
+- `hardware_state_version`
+- camera buffer에서 버린 frame 수
+
+정보 수집은 read-only API로 수행하고 camera property를 열거했다는 이유로 값을 변경하지 않는다.
+Frame과 metadata는 동일한 `frame_id`로 결합하며, shape/dtype가 시작 시 `CameraInfo`와 다르면
+해당 frame을 사용하지 않고 hardware fault로 보고한다.
+
+### 4.12 Raw frame data plane은 shared memory를 사용한다
+
+고해상도 `uint16` frame을 `multiprocessing.Queue`로 직접 pickle하지 않는다. Microscope process가
+두 개 이상의 shared-memory slot을 소유하고 inactive slot에 frame을 쓴 뒤 작은 frame descriptor만
+queue에 게시한다.
+
+Descriptor는 shared-memory name, slot, frame ID, shape, dtype, timestamp와 metadata를 포함한다.
+Controller는 해당 slot을 복사한 뒤 frame ID를 다시 확인해 쓰기 도중의 torn read를 검출한다.
+Feature 계산이 느려 frame을 놓친 경우 최신 descriptor로 건너뛰며, autofocus는 모든 camera frame을
+처리하는 것을 요구하지 않는다.
+
+Shared-memory lifecycle은 다음 원칙을 따른다.
+
+- owner는 microscope process 하나뿐이다.
+- 이름에는 session ID를 포함한다.
+- 정상 종료 시 owner가 close와 unlink를 수행한다.
+- subscriber는 절대 unlink하지 않는다.
+- Python `resource_tracker`의 private API를 monkey-patch하지 않는다.
+- crash 후 남은 segment 정리는 명시적인 session cleanup 경로로 처리한다.
+
+첫 구현에서는 Controller가 shared-memory frame을 복사해 feature를 계산한다. 측정 결과 feature
+계산이 controller responsiveness를 방해할 때에만 별도의 analysis worker를 추가한다.
 
 ## 5. 필요한 데이터
 
@@ -344,6 +535,8 @@ reference만 유지해 불필요한 context가 판단을 흐리지 않게 한다
 ## 9. 제안하는 코드 구조
 
 ```text
+config/
+    autofocus.example.toml
 src/autofocus_jev/
     __init__.py
     config.py
@@ -362,6 +555,7 @@ src/autofocus_jev/
         __init__.py
         messages.py
         queues.py
+        shared_frame.py
     workers/
         __init__.py
         microscope.py
@@ -369,6 +563,7 @@ src/autofocus_jev/
     hardware/
         __init__.py
         base.py
+        metadata.py
         pymmcore_adapter.py
         simulated.py
 tests/
@@ -381,7 +576,10 @@ tests/
     test_hardware_contract.py
     test_history.py
     test_controller.py
+    test_config.py
+    test_camera_metadata.py
     test_ipc.py
+    test_shared_frame.py
 ```
 
 모듈별 책임은 다음과 같다.
@@ -399,9 +597,11 @@ tests/
 - `cli.py`: offline 추출, Jev 평가와 benchmark 명령
 - `ipc/messages.py`: process 간 observation, request, decision, command와 event schema
 - `ipc/queues.py`: bounded queue와 최신 observation 우선 처리
+- `ipc/shared_frame.py`: raw frame double buffer와 frame descriptor
 - `workers/microscope.py`: `CMMCore`를 소유하는 hardware worker entry point
 - `workers/jev.py`: TypeSafe API를 소유하는 Jev worker entry point
 - `hardware/base.py`: 촬영 및 Z 제어를 위한 공통 interface
+- `hardware/metadata.py`: `CameraInfo`와 `FrameMetadata` readback 및 검증
 - `hardware/pymmcore_adapter.py`: `pymmcore.CMMCore` 기반 실제 장비 adapter
 - `hardware/simulated.py`: Z-stack 또는 Micro-Manager demo device 기반 simulator
 
@@ -507,8 +707,12 @@ Jev가 baseline보다 의미 있는 가치를 보이지 않으면 process runtim
 
 ### 단계 8: Concurrent runtime skeleton
 
+- TOML typed configuration loader와 strict validation 구현
+- startup-only/runtime field 분류 및 resolved config snapshot 저장
 - `spawn` 기반 Controller, microscope worker와 Jev worker 구성
 - typed IPC message 및 bounded queue 구현
+- synthetic microscope worker와 shared-memory frame double buffer 구현
+- 최신 frame 우선 소비와 dropped-frame count 구현
 - monotonic sliding window와 immutable snapshot 구현
 - request correlation과 최소 decision validity gate 구현
 - heartbeat, worker crash와 graceful shutdown 처리
@@ -524,14 +728,34 @@ Offline 및 simulator 결과가 목표를 충족한 뒤 `pymmcore.CMMCore` adapt
 Adapter는 capture, current Z 조회, bounded relative move, device wait와 safe shutdown interface를
 구현한다.
 
+구현 순서는 다음과 같다.
+
+1. adapter path 지정 및 Micro-Manager `.cfg` 로딩
+2. `Kinetix_red`, `XYStage`, `ZDrive`, `PFS`, DMD, 두 light engine과 optical-path device 존재 여부 확인
+3. illumination은 off인 상태로 camera의 `Exposure`, `ShutterMode = Never`, `Port = Dynamic Range` 적용
+4. configuration 순서대로 optical path를 적용하고 각 property의 allowed value 및 readback 검증
+5. camera/focus/XY/SLM device를 core에 지정하고 readback하며 PFS precondition이 불명확하면 이동 비활성화
+6. `CameraInfo`, 전체 hardware profile과 MMCore/Device API version 수집 및 저장
+7. continuous sequence acquisition 시작
+8. camera buffer를 제한된 수만큼 drain하고 최신 frame을 shared memory에 publish
+9. frame마다 Z 위치, illumination/optical-path version과 `FrameMetadata` 결합
+10. camera polling, DMD submission과 모든 core command를 단일 event loop에서 직렬화
+11. 별도의 승인된 hardware test에서 bounded absolute/relative focus move와 `waitForDevice` 검증
+12. acquisition 중단, 모든 light/intensity off, shutter close, core reset 순서로 idempotent shutdown 구현
+
 `pymmcore` Python wheel은 `uv.lock`으로 재현하지만 실제 장비 구동에는 별도의 Micro-Manager
 device adapter 설치가 필요하다. 새 컴퓨터에서는 다음 항목을 확인해야 한다.
 
 - 사용할 camera 및 Z stage를 지원하는 Micro-Manager device adapter 설치
+- Kinetix, DMD, `LightEngine`, `Aura`, `XYStage` 제조사 driver 및 vendor library 설치
 - `pymmcore`와 device adapter의 Device Interface Version 일치
 - 해당 컴퓨터에서 Micro-Manager configuration이 정상적으로 로딩되는지 확인
 - `MM_DEVICE_ADAPTER_PATH`와 `MM_CONFIG_PATH`를 로컬 환경에 설정
 - 제조사 driver 및 vendor library가 운영체제에서 인식되는지 확인
+
+`bacteria4`의 `camera_red_only.cfg`와 DMD calibration은 동일 하드웨어를 설명하는 중요한 입력이다.
+라이선스와 장비 정보 공개 범위를 확인한 뒤 공개 가능한 예제 profile은 Git에 추가하고, serial number,
+host 경로 또는 비공개 calibration이 포함된 원본은 로컬 파일로 유지한다.
 
 Device Interface Version은 시작 시 `getAPIVersionInfo()`로 기록하고, configuration 로딩 실패는
 stage 명령을 허용하지 않는 hard failure로 처리한다. 경로와 configuration 파일은 장비별
@@ -574,15 +798,26 @@ Jev가 baseline보다 복잡하기 때문에 정확도뿐 아니라 robustness, 
 ## 12. 테스트 전략
 
 - 순수 계산 모듈은 API 없이 실행되는 단위 테스트를 작성한다.
+- configuration의 unknown key, 잘못된 경로, label 누락과 Z limit 역전을 테스트한다.
 - synthetic blur 및 noise 이미지를 이용해 특징의 기본 성질을 검증한다.
 - Jev client는 mock response로 대부분 테스트한다.
 - hardware contract는 simulator로 테스트하고 실제 장비 테스트는 별도 marker로 분리한다.
 - 가능한 경우 Micro-Manager demo camera와 demo stage로 capture/move integration test를 수행한다.
 - process test에서는 delayed, duplicated, out-of-order 및 dropped message를 주입한다.
+- shared-memory test에서는 shape/dtype mismatch, overwritten slot, torn-read 검출과 owner cleanup을
+  검증한다.
+- camera metadata test에서는 readback과 config override의 source가 명확히 기록되는지 검증한다.
+- rig hardware test에서는 `Kinetix_red`, `XYStage`, DMD, 두 light engine과 optical-path label을 열거하고
+  profile과 다른 항목을 property 변경 전에 실패시킨다.
+- camera acquisition과 DMD pattern submission이 겹치는 시험으로 USB 직렬화가 유지되는지 검증한다.
+- startup 중간 실패와 정상 종료 모두에서 illumination off, intensity 0과 shutter close를 확인한다.
+- PFS 상태를 읽지 못하거나 `pfs_policy`와 다르면 `ZDrive` command가 거부되는지 검증한다.
 - Z 또는 acquisition 설정 변경 후 도착한 Jev response와 expired hardware command가 실행되지
   않는지 검증한다.
 - worker 비정상 종료와 Controller heartbeat 손실 시 fail-safe 동작을 검증한다.
 - 실제 API를 호출하는 테스트에는 별도 marker를 붙이고 기본 test run에서는 제외한다.
+- 실제 hardware test는 Micro-Manager install path와 `.cfg` 존재를 확인한 경우에만 수집하고,
+  stage를 움직이는 테스트는 별도의 명시적 option 없이는 실행하지 않는다.
 - 실제 데이터는 Git에 포함하지 않고 작은 공개 가능 fixture만 저장소에 넣는다.
 - 매 단계에서 `uv sync --frozen`, `pytest`, `ruff check`, `ruff format --check`를 통과시킨다.
 
@@ -608,8 +843,8 @@ Jev가 baseline보다 복잡하기 때문에 정확도뿐 아니라 robustness, 
 4. best-focus를 정한 방법
 5. acceptable-focus의 물리적 또는 시각적 기준
 6. 서로 다른 시료, 시야와 촬영 날짜의 수
-7. 사용할 Micro-Manager camera 및 focus device label과 configuration 파일
-8. 허용 가능한 최대 Z step, Z 범위와 probe 횟수
+7. 동일 rig에서 사용할 Micro-Manager configuration 파일과 PFS 운용 정책
+8. `ZDrive`의 허용 가능한 최대 Z step, Z 범위, 이동 부호, backlash와 probe 횟수
 9. 설치된 device adapter와 `pymmcore`의 Device Interface Version
 
 ## 15. 다음 작업
@@ -620,3 +855,82 @@ Jev가 baseline보다 복잡하기 때문에 정확도뿐 아니라 robustness, 
 데이터가 아직 준비되지 않았다면 synthetic stack fixture로 전체 흐름만 검증한다. Jev가 초점을
 잘 찾는지에 대한 실제 결론은 실제 현미경 Z-stack을 사용한 simulator 결과가 나올 때까지
 보류한다. Concurrent runtime과 `pymmcore` 장비 연결은 go/no-go 평가를 통과한 이후에 진행한다.
+
+## 16. `bacteria4` 참고 결과
+
+이 계획은 `bacteria4`의 문서에 적힌 지시를 그대로 따르지 않고 실제 source와 test에서 확인되는
+구조를 참고했다.
+
+### 참고한 파일
+
+- `lib/scope/config.py`: dataclass config, startup-only locked field와 snapshot
+- `lib/core_mm.py`: adapter path, system configuration 로딩과 idempotent close
+- `lib/devices_mm.py`: continuous acquisition, circular buffer drain과 최신 frame 유지
+- `lib/ring.py`: single-slot latest-value cache와 sequence number
+- `lib/viz.py`: 별도 process에 대한 shared-memory frame 전달
+- `lib/scope/runner.py`: cooperative stop과 worker lifecycle
+- `lib/scope/devices.py`: real/mock device factory와 partial-open cleanup
+- `tests/hardware/`: 실제 rig가 있을 때만 실행되는 hardware test gate
+
+### 채택하는 패턴
+
+- configuration을 typed object로 변환한 뒤 device layer에 전달한다.
+- Micro-Manager `.cfg`가 device 선언을 담당하고 application config가 label과 autofocus policy를
+  담당한다.
+- `CMMCore` instance는 하나의 hardware owner만 사용한다.
+- camera는 continuous acquisition을 사용하고 느린 consumer가 backlog를 따라가지 않게 최신 frame을
+  우선한다.
+- 모든 frame에 sequence ID와 monotonic timestamp를 붙인다.
+- raw frame은 shared memory, 작은 control/metadata는 queue로 분리한다.
+- real/mock 구현은 공통 interface와 factory 뒤에 둔다.
+- hardware가 일부 열린 상태에서 실패해도 close가 반복 호출 가능하도록 만든다.
+- hardware test와 stage-motion test를 일반 CI에서 분리한다.
+
+### 동일 rig에서 직접 재사용할 하드웨어 계약
+
+- 기본 camera label은 `Kinetix_red`, XY stage label은 `XYStage`로 둔다.
+- 기본 focus label은 `ZDrive`로 두며 `PFS`와 `PFSOffset`을 별도 hardware state로 추적한다.
+- Kinetix의 `Exposure`, `ShutterMode = Never`, `Port = Dynamic Range` 적용 순서를 보존하고 readback한다.
+- DMD submission은 `setSLMImage` → `displaySLMImage` → `waitForDevice` 순서를 사용한다.
+- camera buffer 접근과 DMD submission은 동일 USB 임계 구역으로 취급한다.
+- pattern source `LightEngine`과 autofocus source `Aura/GREEN`을 별개 장치로 유지한다.
+- `Nosepiece`부터 CSUW1와 shutter까지 optical-path 적용 순서를 profile에 보존한다.
+- 종료 시 두 light engine의 channel과 intensity를 모두 0으로 만들고 shutter를 닫는다.
+- filter wheel은 자동으로 이동하지 않으며, DMD 180도 flip 여부는 calibration 실험으로 확정한다.
+
+### 그대로 채택하지 않는 부분
+
+- 장비 label과 시작 순서는 같은 rig의 초기 profile로 재사용하지만 serial number, Windows 경로와
+  calibration 파일은 소스 코드에 복사하지 않는다.
+- `bacteria4`의 XY stage adapter를 Z stage adapter로 간주하지 않고 `ZDrive` adapter를 새로 구현한다.
+- DMD와 조명이 있다는 이유만으로 autofocus session 중 pattern 또는 light state를 자동 변경하지 않는다.
+- 현재 property 값이 유효하다는 가정 대신 allowed values와 적용 후 readback을 검사한다.
+- shared-memory 관리를 위해 Python `resource_tracker` private API를 수정하지 않는다.
+- unknown configuration key를 조용히 무시하지 않는다.
+- Micro-Manager가 보고하는 pixel size를 무조건 신뢰하지 않고 source와 fallback을 기록한다.
+
+### 참고 코드보다 강화하는 부분
+
+- frame header와 raw buffer의 원자성을 sequence 재확인 또는 double buffer로 보장한다.
+- width와 height 외에 bit depth, bytes per pixel, component 수, ROI, binning과 exposure를 수집한다.
+- `frame_id`, camera metadata와 Z readback을 하나의 immutable record로 결합한다.
+- config path는 config 파일 기준으로 해석하고 resolved config를 매 실행에 보존한다.
+- CMMCore를 process뿐 아니라 하나의 worker thread에서만 호출해 동시 접근 범위를 최소화한다.
+
+## 17. 구현 현황
+
+현재 첫 번째 코드 단위로 다음 항목을 구현했다.
+
+- `config/autofocus.example.toml`: 동일 rig의 label과 안전한 기본 off 상태를 담은 영문 예제
+- `config.py`: strict TOML loader, typed frozen config, 환경변수 경로 override와 host path 검증
+- `features.py`: Laplacian variance, Tenengrad, 고주파 power ratio, gradient entropy와 노출 특징
+- `hardware/metadata.py`: immutable `CameraInfo`, `FrameMetadata`와 `CapturedFrame`
+- `hardware/pymmcore_adapter.py`: 동일 rig preflight, Kinetix 설정, optical path, 연속 acquisition,
+  최신 frame 선택, Z/PFS safety gate와 fail-safe shutdown
+- fake CMMCore 기반 단위 테스트: 실제 장비 없이 device/property 검증, frame metadata, PFS 및 Z 제한,
+  종료 시 조명과 shutter off 동작을 확인
+
+아직 구현하지 않은 주요 항목은 shared-memory frame transport, 세 process runtime, offline Z-stack
+manifest, feature normalization, Jev client/state schema와 closed-loop controller이다. DMD device는 시작 시
+존재를 확인하지만 pattern submission은 아직 구현하지 않았으므로 `dmd.enabled = true`를 fail-closed로
+거부한다.
